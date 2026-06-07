@@ -27,9 +27,30 @@ const float accelForwardThreshold = 5.0f;
 const float accelSideThreshold = 5.0f;
 const float gravityAlpha = 0.02f;
 
+// ======================================================
+// ROTATION TUNING
+// ======================================================
+// rotationRadiusThreshold: raise if normal tilts trigger rotation,
+// lower if circles are not detected.
+// rotationAngleThreshold: raise toward fullRotationRadians for a fuller circle,
+// lower for faster detection.
+// rotationResetTimeoutMs: raise if slow circles reset too early.
+// rotationCooldownMs: raise if one circle sends repeated rotate commands.
+const float fullRotationRadians = 6.28318530718f;
+const float rotationRadiusThreshold = 4.0f;
+const float rotationAngleThreshold = 5.0f;
+const unsigned long rotationResetTimeoutMs = 700;
+const unsigned long rotationCooldownMs = 600;
+
 float gravityX = 0.0f;
 float gravityY = 0.0f;
 float gravityZ = 0.0f;
+
+float previousRotationAngle = 0.0f;
+float accumulatedRotationAngle = 0.0f;
+bool hasPreviousRotationAngle = false;
+unsigned long lastRotationSampleMs = 0;
+unsigned long lastRotationCommandMs = 0;
 
 // ======================================================
 // COMMAND SYSTEM (SIMPLIFIED)
@@ -42,6 +63,8 @@ enum GestureCommand
     CMD_BACKWARD,
     CMD_MOVE_RIGHT,
     CMD_MOVE_LEFT,
+    CMD_ROTATE_RIGHT,
+    CMD_ROTATE_LEFT,
     CMD_COUNT
 };
 
@@ -51,6 +74,8 @@ const char *commandNames[CMD_COUNT] = {
     "BACKWARD",
     "MOVE_RIGHT",
     "MOVE_LEFT",
+    "ROTATE_RIGHT",
+    "ROTATE_LEFT",
 };
 
 // ======================================================
@@ -72,9 +97,60 @@ int detectGesture(float ax, float ay, float az)
     gravityX = gravityX * (1.0f - gravityAlpha) + ax * gravityAlpha;
     gravityY = gravityY * (1.0f - gravityAlpha) + ay * gravityAlpha;
 
-    // 🔁 FIX AXIS ORIENTATION (MOST IMPORTANT PART)
-    float fx = ay;   // forward/back now based on Y
-    float fy = ax;   // left/right now based on X
+    // FIX AXIS ORIENTATION (MOST IMPORTANT PART)
+    float fx = ay; // forward/back now based on Y
+    float fy = ax; // left/right now based on X
+
+    float rotationRadius = sqrt((fx * fx) + (fy * fy));
+    unsigned long now = millis();
+
+    if (rotationRadius >= rotationRadiusThreshold)
+    {
+        float rotationAngle = atan2(fy, fx);
+
+        if (!hasPreviousRotationAngle || now - lastRotationSampleMs > rotationResetTimeoutMs)
+        {
+            previousRotationAngle = rotationAngle;
+            accumulatedRotationAngle = 0.0f;
+            hasPreviousRotationAngle = true;
+        }
+        else
+        {
+            float rotationDelta = rotationAngle - previousRotationAngle;
+
+            if (rotationDelta > PI)
+                rotationDelta -= fullRotationRadians;
+            else if (rotationDelta < -PI)
+                rotationDelta += fullRotationRadians;
+
+            accumulatedRotationAngle += rotationDelta;
+            previousRotationAngle = rotationAngle;
+
+            if (now - lastRotationCommandMs >= rotationCooldownMs)
+            {
+                if (accumulatedRotationAngle >= rotationAngleThreshold)
+                {
+                    accumulatedRotationAngle = 0.0f;
+                    lastRotationCommandMs = now;
+                    return CMD_ROTATE_RIGHT;
+                }
+
+                if (accumulatedRotationAngle <= -rotationAngleThreshold)
+                {
+                    accumulatedRotationAngle = 0.0f;
+                    lastRotationCommandMs = now;
+                    return CMD_ROTATE_LEFT;
+                }
+            }
+        }
+
+        lastRotationSampleMs = now;
+    }
+    else
+    {
+        hasPreviousRotationAngle = false;
+        accumulatedRotationAngle = 0.0f;
+    }
 
     // DEAD ZONE SAFETY (prevents random STOP spam)
     if (fabs(fx) < 3.0f && fabs(fy) < 3.0f)
@@ -90,7 +166,7 @@ int detectGesture(float ax, float ay, float az)
 
     // right tilt
     if (fy > accelSideThreshold)
-        return CMD_MOVE_LEFT ;
+        return CMD_MOVE_LEFT;
 
     // left tilt
     if (fy < -accelSideThreshold)
