@@ -4,161 +4,164 @@
 #include <Adafruit_Sensor.h>
 #include <esp_now.h>
 #include <WiFi.h>
+#include <math.h>
+#include <string.h>
+
 Adafruit_MPU6050 mpu;
 
-typedef struct struct_message
+struct EspNowMessage
 {
-    char command[10];
-} struct_message;
+    char command[20];
+};
 
-struct_message myData;
-uint8_t receiverMAC[] = {0x00, 0x4B, 0x12, 0x2C, 0xAB, 0xB0};
-const float gyroThreshold = 0.6; // rad/s, about 40 deg/s
-const float accelYThreshold = 5.0;
-const float gravityAlpha = 0.02;
-float gravityX = 0.0;
-float gravityY = 0.0;
-float gravityZ = 0.0;
+EspNowMessage myData;
 
-const int commandHistorySize = 5;
-int commandHistory[commandHistorySize] = {0};
-int historyIndex = 0;
+// CHANGE THIS TO YOUR RECEIVER MAC
+uint8_t receiverMAC[] = {0x00, 0x70, 0x07, 0xA6, 0x24, 0x7C};
+
+// ======================================================
+// THRESHOLDS
+// ======================================================
+
+const float accelForwardThreshold = 5.0f;
+const float accelSideThreshold = 5.0f;
+const float gravityAlpha = 0.02f;
+
+float gravityX = 0.0f;
+float gravityY = 0.0f;
+float gravityZ = 0.0f;
+
+// ======================================================
+// COMMAND SYSTEM (SIMPLIFIED)
+// ======================================================
 
 enum GestureCommand
 {
     CMD_STOP = 0,
     CMD_FORWARD,
     CMD_BACKWARD,
-    CMD_RIGHT,
-    CMD_LEFT,
+    CMD_MOVE_RIGHT,
+    CMD_MOVE_LEFT,
+    CMD_COUNT
 };
 
-const char *commandNames[] = {"STOP", "FORWARD", "BACKWARD", "RIGHT", "LEFT"};
+const char *commandNames[CMD_COUNT] = {
+    "STOP",
+    "FORWARD",
+    "BACKWARD",
+    "MOVE_RIGHT",
+    "MOVE_LEFT",
+};
 
-void OnSent(const uint8_t *mac_addr, esp_now_send_status_t status)
+// ======================================================
+// ESP-NOW CALLBACK
+// ======================================================
+
+void onSent(const uint8_t *macAddress, esp_now_send_status_t status)
 {
-    Serial.print("Message Sent Status: ");
+    Serial.print("Send Status: ");
     Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
+
+// ======================================================
+// SIMPLE GESTURE DETECTION
+// ======================================================
+
+int detectGesture(float ax, float ay, float az)
+{
+    gravityX = gravityX * (1.0f - gravityAlpha) + ax * gravityAlpha;
+    gravityY = gravityY * (1.0f - gravityAlpha) + ay * gravityAlpha;
+
+    // 🔁 FIX AXIS ORIENTATION (MOST IMPORTANT PART)
+    float fx = ay;   // forward/back now based on Y
+    float fy = ax;   // left/right now based on X
+
+    // DEAD ZONE SAFETY (prevents random STOP spam)
+    if (fabs(fx) < 3.0f && fabs(fy) < 3.0f)
+        return CMD_STOP;
+
+    // forward = finger down
+    if (fx > accelForwardThreshold)
+        return CMD_BACKWARD;
+
+    // backward = finger up
+    if (fx < -accelForwardThreshold)
+        return CMD_FORWARD;
+
+    // right tilt
+    if (fy > accelSideThreshold)
+        return CMD_MOVE_LEFT ;
+
+    // left tilt
+    if (fy < -accelSideThreshold)
+        return CMD_MOVE_RIGHT;
+
+    return CMD_STOP;
+}
+// ======================================================
+// SETUP
+// ======================================================
 
 void setup()
 {
     Serial.begin(115200);
     WiFi.mode(WIFI_STA);
+
+    // MPU
     if (!mpu.begin())
     {
-        Serial.println("Failed to find MPU6050 chip");
-        while (true)
-        {
+        Serial.println("MPU6050 not found");
+        while (1)
             delay(10);
-        }
     }
+
+    // ESP-NOW init
     if (esp_now_init() != ESP_OK)
     {
-        Serial.println("Error initializing ESP-NOW");
+        Serial.println("ESP-NOW init failed");
         return;
     }
-    esp_now_register_send_cb(OnSent);
+
+    esp_now_register_send_cb(onSent);
+
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, receiverMAC, 6);
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
+
     if (esp_now_add_peer(&peerInfo) != ESP_OK)
     {
         Serial.println("Failed to add peer");
         return;
     }
+
+    Serial.print("Transmitter MAC: ");
+    Serial.println(WiFi.macAddress());
 }
+
+// ======================================================
+// LOOP
+// ======================================================
+
 void loop()
 {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    sensors_event_t a, g, t;
+    mpu.getEvent(&a, &g, &t);
 
     float ax = a.acceleration.x;
     float ay = a.acceleration.y;
-    float az = a.acceleration.z;
-    float gx = g.gyro.x;
-    float gy = g.gyro.y;
-    float gz = g.gyro.z;
 
-    gravityX = gravityX * (1.0 - gravityAlpha) + ax * gravityAlpha;
-    gravityY = gravityY * (1.0 - gravityAlpha) + ay * gravityAlpha;
-    gravityZ = gravityZ * (1.0 - gravityAlpha) + az * gravityAlpha;
+    int cmd = detectGesture(ax, ay, a.acceleration.z);
 
-    float gNorm = sqrt(gravityX * gravityX + gravityY * gravityY + gravityZ * gravityZ);
-    float gxDeg = gx * 180.0 / PI;
-    float gyDeg = gy * 180.0 / PI;
-    float gzDeg = gz * 180.0 / PI;
+    strlcpy(myData.command,
+            commandNames[cmd],
+            sizeof(myData.command));
 
-    float omegaGravity = 0.0;
-    if (gNorm > 0.1f)
-    {
-        omegaGravity = (gx * gravityX + gy * gravityY + gz * gravityZ) / gNorm;
-    }
+    esp_now_send(receiverMAC,
+                 (uint8_t *)&myData,
+                 sizeof(myData));
 
-    int currentCmd;
-    if (omegaGravity > gyroThreshold)
-    {
-        currentCmd = CMD_RIGHT;
-    }
-    else if (omegaGravity < -gyroThreshold)
-    {
-        currentCmd = CMD_LEFT;
-    }
-    else if (ay > accelYThreshold)
-    {
-        currentCmd = CMD_FORWARD;
-    }
-    else if (ay < -accelYThreshold)
-    {
-        currentCmd = CMD_BACKWARD;
-    }
-    else
-    {
-        currentCmd = CMD_STOP;
-    }
-
-    commandHistory[historyIndex] = currentCmd;
-    historyIndex = (historyIndex + 1) % commandHistorySize;
-
-    int counts[5] = {0};
-    for (int i = 0; i < commandHistorySize; ++i)
-    {
-        int cmd = commandHistory[i];
-        if (cmd >= 0 && cmd <= CMD_LEFT)
-        {
-            counts[cmd]++;
-        }
-    }
-
-    int popularCmd = 0;
-    int popularCount = counts[0];
-    for (int i = 1; i <= CMD_LEFT; ++i)
-    {
-        if (counts[i] > popularCount)
-        {
-            popularCount = counts[i];
-            popularCmd = i;
-        }
-    }
-
-    strcpy(myData.command, commandNames[popularCmd]);
-    esp_now_send(receiverMAC, (uint8_t *)&myData, sizeof(myData));
-
-    float omegaGravityDeg = omegaGravity * 180.0 / PI;
-    Serial.print("AX:");
-    Serial.print(ax, 2);
-    Serial.print(" AY:");
-    Serial.print(ay, 2);
-    Serial.print(" GZ:");
-    Serial.print(gzDeg, 1);
-    Serial.print("d/s OG:");
-    Serial.print(omegaGravityDeg, 1);
-    Serial.print("d/s | Raw:");
-    Serial.print(commandNames[currentCmd]);
-    Serial.print(" | Vote:");
-    Serial.print(commandNames[popularCmd]);
-    Serial.print(" | Cmd:");
+    Serial.print("CMD: ");
     Serial.println(myData.command);
 
     delay(100);
