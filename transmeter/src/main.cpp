@@ -30,27 +30,29 @@ const float gravityAlpha = 0.02f;
 // ======================================================
 // ROTATION TUNING
 // ======================================================
-// rotationRadiusThreshold: raise if normal tilts trigger rotation,
-// lower if circles are not detected.
-// rotationAngleThreshold: raise toward fullRotationRadians for a fuller circle,
-// lower for faster detection.
-// rotationResetTimeoutMs: raise if slow circles reset too early.
+// rotationAxisChangeThreshold: raise if normal gestures trigger rotation,
+// lower if rotation is not detected.
 // rotationCooldownMs: raise if one circle sends repeated rotate commands.
-const float fullRotationRadians = 6.28318530718f;
-const float rotationRadiusThreshold = 4.0f;
-const float rotationAngleThreshold = 5.0f;
-const unsigned long rotationResetTimeoutMs = 700;
+const float rotationAxisChangeThreshold = 2.0f;
 const unsigned long rotationCooldownMs = 600;
+const bool mpuDebugLogs = true;
+const bool rotationDebugLogs = true;
 
 float gravityX = 0.0f;
 float gravityY = 0.0f;
 float gravityZ = 0.0f;
 
-float previousRotationAngle = 0.0f;
-float accumulatedRotationAngle = 0.0f;
-bool hasPreviousRotationAngle = false;
-unsigned long lastRotationSampleMs = 0;
 unsigned long lastRotationCommandMs = 0;
+
+float debugFx = 0.0f;
+float debugFy = 0.0f;
+float debugFxDelta = 0.0f;
+float debugFyDelta = 0.0f;
+bool debugRotationCandidate = false;
+
+float previousFx = 0.0f;
+float previousFy = 0.0f;
+bool hasPreviousMappedAxes = false;
 
 // ======================================================
 // COMMAND SYSTEM (SIMPLIFIED)
@@ -63,8 +65,7 @@ enum GestureCommand
     CMD_BACKWARD,
     CMD_MOVE_RIGHT,
     CMD_MOVE_LEFT,
-    CMD_ROTATE_RIGHT,
-    CMD_ROTATE_LEFT,
+    CMD_ROTATION,
     CMD_COUNT
 };
 
@@ -74,8 +75,7 @@ const char *commandNames[CMD_COUNT] = {
     "BACKWARD",
     "MOVE_RIGHT",
     "MOVE_LEFT",
-    "ROTATE_RIGHT",
-    "ROTATE_LEFT",
+    "ROTATION",
 };
 
 // ======================================================
@@ -101,55 +101,33 @@ int detectGesture(float ax, float ay, float az)
     float fx = ay; // forward/back now based on Y
     float fy = ax; // left/right now based on X
 
-    float rotationRadius = sqrt((fx * fx) + (fy * fy));
-    unsigned long now = millis();
+    debugFx = fx;
+    debugFy = fy;
 
-    if (rotationRadius >= rotationRadiusThreshold)
+    if (hasPreviousMappedAxes)
     {
-        float rotationAngle = atan2(fy, fx);
-
-        if (!hasPreviousRotationAngle || now - lastRotationSampleMs > rotationResetTimeoutMs)
-        {
-            previousRotationAngle = rotationAngle;
-            accumulatedRotationAngle = 0.0f;
-            hasPreviousRotationAngle = true;
-        }
-        else
-        {
-            float rotationDelta = rotationAngle - previousRotationAngle;
-
-            if (rotationDelta > PI)
-                rotationDelta -= fullRotationRadians;
-            else if (rotationDelta < -PI)
-                rotationDelta += fullRotationRadians;
-
-            accumulatedRotationAngle += rotationDelta;
-            previousRotationAngle = rotationAngle;
-
-            if (now - lastRotationCommandMs >= rotationCooldownMs)
-            {
-                if (accumulatedRotationAngle >= rotationAngleThreshold)
-                {
-                    accumulatedRotationAngle = 0.0f;
-                    lastRotationCommandMs = now;
-                    return CMD_ROTATE_RIGHT;
-                }
-
-                if (accumulatedRotationAngle <= -rotationAngleThreshold)
-                {
-                    accumulatedRotationAngle = 0.0f;
-                    lastRotationCommandMs = now;
-                    return CMD_ROTATE_LEFT;
-                }
-            }
-        }
-
-        lastRotationSampleMs = now;
+        debugFxDelta = fx - previousFx;
+        debugFyDelta = fy - previousFy;
     }
     else
     {
-        hasPreviousRotationAngle = false;
-        accumulatedRotationAngle = 0.0f;
+        debugFxDelta = 0.0f;
+        debugFyDelta = 0.0f;
+        hasPreviousMappedAxes = true;
+    }
+
+    previousFx = fx;
+    previousFy = fy;
+
+    unsigned long now = millis();
+
+    debugRotationCandidate = fabs(debugFxDelta) >= rotationAxisChangeThreshold &&
+                             fabs(debugFyDelta) >= rotationAxisChangeThreshold;
+
+    if (debugRotationCandidate && now - lastRotationCommandMs >= rotationCooldownMs)
+    {
+        lastRotationCommandMs = now;
+        return CMD_ROTATION;
     }
 
     // DEAD ZONE SAFETY (prevents random STOP spam)
@@ -239,6 +217,46 @@ void loop()
 
     Serial.print("CMD: ");
     Serial.println(myData.command);
+
+    if (mpuDebugLogs)
+    {
+        Serial.print("MPU ax=");
+        Serial.print(a.acceleration.x);
+        Serial.print(" ay=");
+        Serial.print(a.acceleration.y);
+        Serial.print(" az=");
+        Serial.print(a.acceleration.z);
+        Serial.print(" gx=");
+        Serial.print(g.gyro.x);
+        Serial.print(" gy=");
+        Serial.print(g.gyro.y);
+        Serial.print(" gz=");
+        Serial.print(g.gyro.z);
+        Serial.print(" temp=");
+        Serial.print(t.temperature);
+        Serial.print(" fx=");
+        Serial.print(debugFx);
+        Serial.print(" fy=");
+        Serial.print(debugFy);
+        Serial.print(" dfx=");
+        Serial.print(debugFxDelta);
+        Serial.print(" dfy=");
+        Serial.print(debugFyDelta);
+        Serial.print(" cmd=");
+        Serial.println(myData.command);
+    }
+
+    if (rotationDebugLogs)
+    {
+        Serial.print("ROTATION_CHECK dfx=");
+        Serial.print(debugFxDelta);
+        Serial.print(" dfy=");
+        Serial.print(debugFyDelta);
+        Serial.print(" candidate=");
+        Serial.print(debugRotationCandidate ? "YES" : "NO");
+        Serial.print(" cmd=");
+        Serial.println(myData.command);
+    }
 
     delay(100);
 }
